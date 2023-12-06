@@ -202,7 +202,8 @@ def make_transform(
     output_height: Optional[int],
     resize_filter: str
 ) -> Callable[[np.ndarray], Optional[np.ndarray]]:
-    resample = { 'box': PIL.Image.BOX, 'lanczos': PIL.Image.LANCZOS }[resize_filter]
+    # resample = { 'box': PIL.Image.BOX, 'lanczos': PIL.Image.LANCZOS }[resize_filter]
+    resample = { 'box': PIL.Image.Resampling.BOX, 'lanczos': PIL.Image.Resampling.LANCZOS }[resize_filter]
     def scale(width, height, img):
         w = img.shape[1]
         h = img.shape[0]
