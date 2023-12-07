@@ -11,6 +11,7 @@
 import copy
 import os
 from time import perf_counter
+import itertools
 
 import click
 import imageio
@@ -18,7 +19,6 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn.functional as F
-import itertools
 
 import dnnlib
 import legacy
@@ -28,8 +28,8 @@ import utils_data
 
 verbose = True
 
-def get_D_features(D,
-                   img):
+def get_disc_features(D,
+                      img):
     """
     This function extracts discrimator's features for the image.
 
@@ -38,10 +38,10 @@ def get_D_features(D,
 
     : return : extracted features
     """
-    x = None
+    feats = None
     for res in D.block_resolutions:
-        x, img = getattr(D, f'b{res}')(x, img)
-    return x
+        feats, img = getattr(D, f'b{res}')(feats, img)
+    return feats
 
 def save_real_and_generated_samples(G,
                                     nsamples,
@@ -49,7 +49,6 @@ def save_real_and_generated_samples(G,
                                     device):
     """
     This function saves real and generated images.
-
     : param G : Trained Generator
     : param nsamples : Number of images to generate
     : param fname : path where the real and generated images should be saved
@@ -58,62 +57,70 @@ def save_real_and_generated_samples(G,
     # save real images
     x_samples = utils_data.load_real_images(nsamples)
     utils_vis.save_images(x_samples, f"{fname}_real.png")
-    
     # save generated images
     G = copy.deepcopy(G).eval().requires_grad_(False).to(device) # type: ignore
     z_samples = np.random.RandomState(123).randn(nsamples, G.z_dim)
     x_samples = G(torch.from_numpy(z_samples).to(device), None)
     utils_vis.save_images(x_samples.detach().cpu().numpy(), f"{fname}_fake.png")
-    
+    # return
     return 0
 
-def load_image(fname, size):
+def load_image(fname,
+               size):
     """
     This function loads an image from disk.
-
     : param fname: The filename of the image to be loaded.
     : param size: Size of the output image.
-
-    : return : image as a numpy array of size (size, 1) for grayscale images and (size, 3) for rgb images
+    : return : image as a numpy array of size
+               (size, 1) for grayscale images /
+               (size, 3) for rgb images
     """
     image_pil = PIL.Image.open(fname).convert('L') # .convert('RGB') for rgb images
     # crop image if it not square
-    w, h = image_pil.size
-    s = min(w, h)
-    image_pil = image_pil.crop(((w - s) // 2, (h - s) // 2, (w + s) // 2, (h + s) // 2))
+    width, height = image_pil.size
+    short = min(width, height)
+    image_pil = image_pil.crop(((width - short) // 2,
+                                (height - short) // 2,
+                                (width + short) // 2,
+                                (height + short) // 2))
     # resize to required resolution
     image_pil = image_pil.resize(size, PIL.Image.Resampling.LANCZOS)
-    
-    return np.expand_dims(np.array(image_pil, dtype=np.uint8), axis=-1) # expand_dims needed for grayscale images
+    # expand_dims needed for grayscale images
+    return np.expand_dims(np.array(image_pil, dtype=np.uint8), axis=-1)
 
-def load_nets(network_pkl, device):
+def load_nets(network_pkl,
+              device):
     """
     This function load networks from a pickle file.
 
     : param network_pkl: Path of the pickle file
     : param device: Device on which to define the models
 
-    : return G: Generator
-    : return D: Discriminator
+    : return gen: Generator
+    : return disc: Discriminator
     """
-    print('Loading networks from "%s"...' % network_pkl)
-    with dnnlib.util.open_url(network_pkl) as fp:
-        data = legacy.load_network_pkl(fp)
+    print(f'Loading networks from {network_pkl}...')
+    with dnnlib.util.open_url(network_pkl) as file_pointer:
+        data = legacy.load_network_pkl(file_pointer)
     G = data['G_ema'].requires_grad_(False).to(device) # type: ignore
     D = data['D'].requires_grad_(False).to(device) # type: ignore
     return G, D
 
-def save_video_showing_optimization(fname, w_steps, m_steps, G, target):
+def save_video_showing_optimization(fname,
+                                    w_steps,
+                                    m_steps,
+                                    G,
+                                    target):
     """
     This function saves a video showing the optimization process.
     """
     video = imageio.get_writer(fname, mode='I', fps=10, codec='libx264', bitrate='16M')
     print (f'Saving optimization progress video at {fname}.')
-    for w, m in zip(w_steps, m_steps):
-        synth_image = G.synthesis(w.unsqueeze(0), noise_mode='const')
+    for w_vector, mask in zip(w_steps, m_steps):
+        synth_image = G.synthesis(w_vector.unsqueeze(0), noise_mode='const')
         synth_image = (synth_image + 1) * (255/2)
         synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
-        mask = (m * 255).permute(1, 2, 0).to(torch.uint8).cpu().numpy()
+        mask = (mask * 255).permute(1, 2, 0).to(torch.uint8).cpu().numpy()
         video.append_data(np.concatenate([target, synth_image, mask], axis=1))
     video.close()
 
@@ -123,8 +130,12 @@ def logprint(*args):
     """
     if verbose:
         print(*args)
-        
-def get_w_stats(num_samples, G, device):
+    # return
+    return 0
+
+def get_w_stats(num_samples,
+                G,
+                device):
     """
     This function computes mean and std. dev in the w-space.
     """
@@ -135,21 +146,28 @@ def get_w_stats(num_samples, G, device):
     w_avg = np.mean(w_samples, axis=0, keepdims=True)      # [1, 1, C]
     w_std = (np.sum((w_samples - w_avg) ** 2) / num_samples) ** 0.5
     return w_avg, w_std
-    
-def get_lr(t, lr_rampdown_length, lr_rampup_length, initial_learning_rate):
+
+def get_lr(normalized_step,
+           lr_rampdown_length,
+           lr_rampup_length,
+           initial_learning_rate):
     """
     This function computes the learning rate at the given step in the optimization.
     """
-    lr_ramp = min(1.0, (1.0 - t) / lr_rampdown_length)
+    lr_ramp = min(1.0, (1.0 - normalized_step) / lr_rampdown_length)
     lr_ramp = 0.5 - 0.5 * np.cos(lr_ramp * np.pi)
-    lr_ramp = lr_ramp * min(1.0, t / lr_rampup_length)
+    lr_ramp = lr_ramp * min(1.0, normalized_step / lr_rampup_length)
     return initial_learning_rate * lr_ramp
 
-def get_w_noise_scale(t, w_std, initial_noise_factor, noise_ramp_length):
+def get_w_noise_scale(normalized_step,
+                      w_std,
+                      initial_noise_factor,
+                      noise_ramp_length):
     """
-    This function computes the scale of the noise to be added to the w-vector at the given step in the optimization
+    This function computes the scale of the noise
+    to be added to the w-vector at the given step in the optimization.
     """
-    return w_std * initial_noise_factor * max(0.0, 1.0 - t / noise_ramp_length) ** 2
+    return w_std * initial_noise_factor * max(0.0, 1.0 - normalized_step / noise_ramp_length) ** 2
 
 # Noise regularization loss
 def get_noise_reg_loss(noise_bufs):
@@ -157,8 +175,8 @@ def get_noise_reg_loss(noise_bufs):
     This function computes the noise regularization loss described in styleGANv2.
     """
     reg_loss = 0.0
-    for v in noise_bufs.values():
-        noise = v[None,None,:,:] # must be [1,1,H,W] for F.avg_pool2d()
+    for val in noise_bufs.values():
+        noise = val[None,None,:,:] # must be [1,1,H,W] for F.avg_pool2d()
         while True:
             reg_loss += (noise*torch.roll(noise, shifts=1, dims=3)).mean()**2
             reg_loss += (noise*torch.roll(noise, shifts=1, dims=2)).mean()**2
@@ -170,7 +188,7 @@ def get_noise_reg_loss(noise_bufs):
 def project(
     G,
     D,
-    target: torch.Tensor, # [C,H,W] and dynamic range [0,255], W & H must match G output resolution
+    target: torch.Tensor, # [C,H,W], dynamic range [0,255], W, H must match G res
     *,
     num_steps                  = 1000,
     w_avg_samples              = 10000,
@@ -206,8 +224,9 @@ def project(
     noise_bufs = { name: buf for (name, buf) in G.synthesis.named_buffers() if 'noise_const' in name }
 
     # Features for target image.
-    target_images = target.unsqueeze(0).to(device).to(torch.float32) / 127.5 - 1 # scale intensities to -1 to 1 # [1, nc, nx, ny]
-    target_features = get_D_features(D, target_images)
+    # Scale intensities to -1 to 1 # [1, nc, nx, ny]
+    target_images = target.unsqueeze(0).to(device).to(torch.float32) / 127.5 - 1
+    target_features = get_disc_features(D, target_images)
 
     # Initialize mask: same size as the target image
     mask = torch.zeros_like(input = target_images, requires_grad=True) # [1, nc, nx, ny]
@@ -220,7 +239,8 @@ def project(
     mask_out = torch.zeros([num_steps] + list(mask.shape[1:]), dtype=torch.float32, device=device)
 
     # Create an optimizer object with the
-    optimizer = torch.optim.Adam(params = [w_opt] + list(noise_bufs.values()) + [mask], betas=(0.9, 0.999), lr=initial_learning_rate)
+    optimizer = torch.optim.Adam(params = [w_opt] + list(noise_bufs.values()) + [mask],
+                                 betas=(0.9, 0.999), lr=initial_learning_rate)
 
     # Init noise.
     for buf in noise_bufs.values():
@@ -229,36 +249,55 @@ def project(
 
     for step in range(num_steps):
         # Learning rate schedule.
-        t = step / num_steps
-        lr = get_lr(t, lr_rampdown_length, lr_rampup_length, initial_learning_rate)
+        step_normalized = step / num_steps
+        learning_rate = get_lr(step_normalized,
+                               lr_rampdown_length,
+                               lr_rampup_length,
+                               initial_learning_rate)
         for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+            param_group['lr'] = learning_rate
 
         # Get synth images from opt_w.
-        w_noise_scale = get_w_noise_scale(t, w_std, initial_noise_factor, noise_ramp_length)
+        w_noise_scale = get_w_noise_scale(step_normalized,
+                                          w_std,
+                                          initial_noise_factor,
+                                          noise_ramp_length)
         w_noise = torch.randn_like(w_opt) * w_noise_scale
-        ws = (w_opt + w_noise).repeat([1, G.mapping.num_ws, 1])
-        synth_images = G.synthesis(ws, noise_mode='const')
+        w_vectors = (w_opt + w_noise).repeat([1, G.mapping.num_ws, 1])
+        synth_images = G.synthesis(w_vectors, noise_mode='const')
 
         # Features for synth images.
-        synth_features = get_D_features(D, synth_images)
-        
+        synth_features = get_disc_features(D, synth_images)
+
         # Pixel-wise loss: loss_r = (target_images - synth_images).abs().mean()
-        # Recon losses as in Schlegl et al. "Unsupervised anomaly detection with GANs." IPMI 2017 https://arxiv.org/pdf/1703.05921.pdf
-        # Masked loss as in Mou et al. "Mask-free GAN inverseion" ICKR 2023 https://arxiv.org/pdf/2302.12464.pdf        
+        # Recon losses as in Schlegl et al. "Unsupervised anomaly detection with GANs."
+        #                               IPMI 2017 https://arxiv.org/pdf/1703.05921.pdf
+        # Masked loss as in Mou et al. "Mask-free GAN inverseion"
+        #                               ICKR 2023 https://arxiv.org/pdf/2302.12464.pdf
         binary_mask = torch.sigmoid(mask)
-        loss_m = binary_mask.mean() # loss that encourages the mask to be small
-        loss_r = ((1.0 - binary_mask) * (target_images - synth_images).abs()).mean() # Pixel-wise L1 recon loss in un-masked pixels
-        loss_d = (target_features - synth_features).abs().mean() # Element-wise L1 loss in feature space of Discriminator
-        loss_n = get_noise_reg_loss(noise_bufs) # Noise regularization loss from styleGANv2
-        loss = (1 - lambda_d) * loss_r + lambda_d * loss_d + lambda_m * loss_m + lambda_n * loss_n
+        # loss that encourages the mask to be small
+        loss_m = binary_mask.mean()
+        # Pixel-wise L1 recon loss in un-masked pixels
+        loss_r = ((1.0 - binary_mask) * (target_images - synth_images).abs()).mean()
+        # Element-wise L1 loss in feature space of Discriminator
+        loss_d = (target_features - synth_features).abs().mean()
+        # Noise regularization loss from styleGANv2
+        loss_n = get_noise_reg_loss(noise_bufs)
+        # Total loss
+        loss = (1-lambda_d)*loss_r + lambda_d*loss_d + lambda_m*loss_m + lambda_n*loss_n
 
         # Step
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
         if step%100==0:
-            logprint(f'step {step+1:>4d}/{num_steps}: loss_m {loss_m:<4.2f} loss_r {loss_r:<4.2f} loss_d {loss_d:<4.2f} loss_n {loss_n:<4.2f} loss {loss:<4.2f}')
+            loss_str = f'step {step+1:>4d}/{num_steps}:'
+            loss_str = f'{loss_str} loss_m {loss_m:<4.2f}'
+            loss_str = f'{loss_str} loss_r {loss_r:<4.2f}'
+            loss_str = f'{loss_str} loss_d {loss_d:<4.2f}'
+            loss_str = f'{loss_str} loss_n {loss_n:<4.2f}'
+            loss_str = f'{loss_str} loss {loss:<4.2f}'
+            logprint(loss_str)
 
         # Save projected W and mask for each optimization step.
         w_out[step] = w_opt.detach()[0]
@@ -275,21 +314,19 @@ def project(
 #----------------------------------------------------------------------------
 
 @click.command()
-@click.option('--network', 'network_pkl',             help='Network pickle filename', required=True)
-@click.option('--target_basepath', 'target_basepath', help='Basepath of target image files to project to', required=True, metavar='FILE')
-@click.option('--num_steps',                          help='Number of optimization steps', type=int, default=501, show_default=True)
-@click.option('--seed',                               help='Random seed', type=int, default=303, show_default=True)
-@click.option('--save-video',                         help='Save an mp4 video of optimization progress', type=bool, default=False, show_default=True)
-@click.option('--outdir',                             help='Where to save the output images', required=True, metavar='DIR')
-@click.option('--lambda_d_loss',                      help='Regularization weight', type=float, default=0.01, show_default=True)
+@click.option('--network', 'network_pkl',     help='Network pickle filename', required=True)
+@click.option('--target_path', 'target_path', help='Path of target images', required=True, metavar='FILE')
+@click.option('--num_steps',                  help='Num optim. steps', type=int, default=501, show_default=True)
+@click.option('--seed',                       help='Random seed', type=int, default=303, show_default=True)
+@click.option('--save_video',                 help='Save mp4 video of optim.', type=bool, default=False, show_default=True)
+@click.option('--outdir',                     help='Where to save the output images', required=True, metavar='DIR')
 def run_projection(
     network_pkl: str,
-    target_basepath: str,
+    target_path: str,
     outdir: str,
     save_video: bool,
     seed: int,
-    num_steps: int,
-    lambda_d_loss: float
+    num_steps: int
 ):
     """Project given image to the latent space of pretrained network pickle.
 
@@ -313,29 +350,32 @@ def run_projection(
         save_real_and_generated_samples(G, nsamples=48, fname=f"{outdir}", device=device)
 
     # set here: which images to be reconstructed, and with which settings
-    image_indices = [100] # range(2000, 3000, 100) # start, end, step
+    image_indices = [101] # range(2000, 3000, 100) # start, end, step
     lams_d_loss = [0.01] # [0.0, 0.001, 0.01, 0.1]
-    lams_mask_loss = [0.5] # np.round(np.arange(0.2, 1.0, 0.1), 2) # # magic happens between 0.1 and 1.0 [0.0, 1.0]
+    lams_mask_loss = [0.5] # np.round(np.arange(0.2, 1.0, 0.1), 2)
+    # magic happens between 0.1 and 1.0 [0.0, 1.0]
 
     # reconstruct target image(s)
     recon_images = True
     if recon_images:
-        for image_idx, lam_d_loss, lam_m_loss in itertools.product(image_indices, lams_d_loss, lams_mask_loss):
+        settings = itertools.product(image_indices, lams_d_loss, lams_mask_loss)
+        for image_idx, lam_d_loss, lam_m_loss in settings:
 
             # create dir for this image
             outdir_this_image = f"{outdir}image{image_idx}/lambda_d{lam_d_loss}_mask{lam_m_loss}/"
             os.makedirs(outdir_this_image, exist_ok=True)
 
             # Load target image.
-            target = load_image(fname = f"{target_basepath}image_{image_idx}.png", size = (G.img_resolution, G.img_resolution))
+            target = load_image(fname = f"{target_path}image_{image_idx}.png",
+                                size = (G.img_resolution, G.img_resolution))
 
             # Optimize projection.
             start_time = perf_counter()
             projected_w_steps, mask_steps = project(G,
                                                     D,
-                                                    target = torch.tensor(target.transpose([2, 0, 1]), device=device), # pylint: disable=not-callable
+                                                    target = torch.tensor(target.transpose([2, 0, 1]), device=device), # pylint: disable=line-too-long
                                                     num_steps = num_steps,
-                                                    lambda_d = lam_d_loss, 
+                                                    lambda_d = lam_d_loss,
                                                     lambda_m = lam_m_loss,
                                                     device = device)
             print (f'Elapsed: {(perf_counter()-start_time):.1f} s')
@@ -354,11 +394,14 @@ def run_projection(
             synth_image = synth_image.permute(0, 2, 3, 1)[0,:,:,0].cpu().numpy()
             mask = mask_steps.permute(0, 2, 3, 1)[-1,:,:,0].cpu().numpy()
             images_to_save = [target_image, synth_image, target_image - synth_image, mask]
-            utils_vis.save_images(images = images_to_save, fname = f'{outdir_this_image}result.png', nr = 1, nc = len(images_to_save))
+            utils_vis.save_images(images = images_to_save,
+                                  fname = f'{outdir_this_image}result.png',
+                                  nr = 1,
+                                  nc = len(images_to_save))
 
             # Save final W vector.
-            np.savez(f'{outdir_this_image}projected_w.npz', w=projected_w_steps[-1].unsqueeze(0).cpu().numpy())
-                
+            np.savez(f'{outdir_this_image}projected_w.npz',
+                     w=projected_w_steps[-1].unsqueeze(0).cpu().numpy())
 
 #----------------------------------------------------------------------------
 
