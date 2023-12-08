@@ -26,7 +26,9 @@ import legacy
 import utils_vis
 import utils_data
 
-verbose = True
+VERBOSE = True
+
+#----------------------------------------------------------------------------
 
 def get_disc_features(D,
                       img):
@@ -42,6 +44,8 @@ def get_disc_features(D,
     for res in D.block_resolutions:
         feats, img = getattr(D, f'b{res}')(feats, img)
     return feats
+
+#----------------------------------------------------------------------------
 
 def save_real_and_generated_samples(G,
                                     nsamples,
@@ -64,6 +68,8 @@ def save_real_and_generated_samples(G,
     utils_vis.save_images(x_samples.detach().cpu().numpy(), f"{fname}_fake.png")
     # return
     return 0
+
+#----------------------------------------------------------------------------
 
 def load_image(fname,
                size):
@@ -88,6 +94,8 @@ def load_image(fname,
     # expand_dims needed for grayscale images
     return np.expand_dims(np.array(image_pil, dtype=np.uint8), axis=-1)
 
+#----------------------------------------------------------------------------
+
 def load_nets(network_pkl,
               device):
     """
@@ -106,32 +114,74 @@ def load_nets(network_pkl,
     D = data['D'].requires_grad_(False).to(device) # type: ignore
     return G, D
 
+#----------------------------------------------------------------------------
+
 def save_video_showing_optimization(fname,
                                     w_steps,
                                     m_steps,
                                     G,
-                                    target):
+                                    losses,
+                                    target,
+                                    step_delta = 10):
     """
     This function saves a video showing the optimization process.
     """
-    video = imageio.get_writer(fname, mode='I', fps=10, codec='libx264', bitrate='16M')
+    
+    # create video file
+    video = imageio.get_writer(fname, mode='I', fps=1, codec='libx264', bitrate='16M')
     print (f'Saving optimization progress video at {fname}.')
-    for w_vector, mask in zip(w_steps, m_steps):
-        synth_image = G.synthesis(w_vector.unsqueeze(0), noise_mode='const')
-        synth_image = (synth_image + 1) * (255/2)
-        synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
-        mask = (mask * 255).permute(1, 2, 0).to(torch.uint8).cpu().numpy()
-        video.append_data(np.concatenate([target, synth_image, mask], axis=1))
+
+    # convert target from uint to float between -1 and 1
+    target_ = target.astype(np.float32) / 127.5 - 1 # range [-1, 1]
+
+    # save video frames
+    for step, wm_tuple in enumerate(zip(w_steps, m_steps)):
+        if step % step_delta == 0:
+
+            w_vector, mask = wm_tuple
+
+            # synthesize image for this w_vector
+            synth_image = G.synthesis(w_vector.unsqueeze(0), noise_mode='const') # range [-1, 1]
+            synth_image = synth_image.permute(0, 2, 3, 1)[0].cpu().numpy() # shape [nx, ny]
+
+            # error image
+            error_image = abs(synth_image - target_) / 2.0
+
+            # estimated mask at this iteration
+            mask = mask.cpu().numpy() # range [0, 1]
+
+            # get image containing line plots for the losses until this step
+            # this takes quite long. do it only once for now
+            # pass final step instead of current step to save time.
+            if step == 0:
+                loss_plot = utils_vis.plot_losses_and_return_image(losses,
+                                                                   step=w_steps.shape[0]-1, 
+                                                                   size=(mask.shape[1:]))
+
+            # prepare video frame
+            images = [target_, synth_image, error_image, mask, loss_plot]
+            cmaps = ['gray'] * (len(images) - 1) + [None]
+            clims = [(-1.0, 1.0)] * 2 + [(0.0, 1.0), (0.0, 1.0), (None)]
+            video_frame = utils_vis.prepare_video_frame(data = zip(images, cmaps, clims))
+
+            # append to video
+            video.append_data(video_frame)                     
+            
+    # close video
     video.close()
+
+#----------------------------------------------------------------------------
 
 def logprint(*args):
     """
     This function prints its inputs.
     """
-    if verbose:
+    if VERBOSE:
         print(*args)
     # return
     return 0
+
+#----------------------------------------------------------------------------
 
 def get_w_stats(num_samples,
                 G,
@@ -147,6 +197,8 @@ def get_w_stats(num_samples,
     w_std = (np.sum((w_samples - w_avg) ** 2) / num_samples) ** 0.5
     return w_avg, w_std
 
+#----------------------------------------------------------------------------
+
 def get_lr(normalized_step,
            lr_rampdown_length,
            lr_rampup_length,
@@ -159,6 +211,8 @@ def get_lr(normalized_step,
     lr_ramp = lr_ramp * min(1.0, normalized_step / lr_rampup_length)
     return initial_learning_rate * lr_ramp
 
+#----------------------------------------------------------------------------
+
 def get_w_noise_scale(normalized_step,
                       w_std,
                       initial_noise_factor,
@@ -169,7 +223,8 @@ def get_w_noise_scale(normalized_step,
     """
     return w_std * initial_noise_factor * max(0.0, 1.0 - normalized_step / noise_ramp_length) ** 2
 
-# Noise regularization loss
+#----------------------------------------------------------------------------
+
 def get_noise_reg_loss(noise_bufs):
     """
     This function computes the noise regularization loss described in styleGANv2.
@@ -184,6 +239,8 @@ def get_noise_reg_loss(noise_bufs):
                 break
             noise = F.avg_pool2d(noise, kernel_size=2)
     return reg_loss
+
+#----------------------------------------------------------------------------
 
 def project(
     G,
@@ -210,6 +267,7 @@ def project(
 
     : return w: w vectors over the optimization trajectory.
     : return mask: masks over the optimization trajectory.
+    : return losses: dict with keys loss_types and values lists of size [num_steps].
 
     """
     assert target.shape == (G.img_channels, G.img_resolution, G.img_resolution)
@@ -247,6 +305,11 @@ def project(
         buf[:] = torch.randn_like(buf)
         buf.requires_grad = True
 
+    # Initialize dictionary to save various loss during optimization
+    loss_names = ["recon", "disc", "mask", "noise"]
+    losses = {loss_name : [0.0] * num_steps for loss_name in loss_names}
+
+    # Optimization iterations
     for step in range(num_steps):
         # Learning rate schedule.
         step_normalized = step / num_steps
@@ -299,6 +362,12 @@ def project(
             loss_str = f'{loss_str} loss {loss:<4.2f}'
             logprint(loss_str)
 
+        # Store losses
+        losses['recon'][step] = loss_r.item()
+        losses['disc'][step] = loss_d.item()
+        losses['mask'][step] = loss_m.item()
+        losses['noise'][step] = loss_n.item()
+
         # Save projected W and mask for each optimization step.
         w_out[step] = w_opt.detach()[0]
         mask_out[step] = binary_mask.detach()[0]
@@ -309,7 +378,7 @@ def project(
                 buf -= buf.mean()
                 buf *= buf.square().mean().rsqrt()
 
-    return w_out.repeat([1, G.mapping.num_ws, 1]), mask_out
+    return w_out.repeat([1, G.mapping.num_ws, 1]), mask_out, losses
 
 #----------------------------------------------------------------------------
 
@@ -350,9 +419,9 @@ def run_projection(
         save_real_and_generated_samples(G, nsamples=48, fname=f"{outdir}", device=device)
 
     # set here: which images to be reconstructed, and with which settings
-    image_indices = [101] # range(2000, 3000, 100) # start, end, step
-    lams_d_loss = [0.01] # [0.0, 0.001, 0.01, 0.1]
-    lams_mask_loss = [0.5] # np.round(np.arange(0.2, 1.0, 0.1), 2)
+    image_indices = [301] # range(0, 1100, 100) # start, end, step
+    lams_d_loss = [0.01] # [0.0, 0.01, 0.1] # [0.0, 0.001, 0.01, 0.1]
+    lams_mask_loss = [0.5] # [0.0, 0.5, 1.0] # np.round(np.arange(0.2, 1.0, 0.1), 2)
     # magic happens between 0.1 and 1.0 [0.0, 1.0]
 
     # reconstruct target image(s)
@@ -371,37 +440,40 @@ def run_projection(
 
             # Optimize projection.
             start_time = perf_counter()
-            projected_w_steps, mask_steps = project(G,
+            projected_w_steps, mask_steps, losses = project(G,
                                                     D,
                                                     target = torch.tensor(target.transpose([2, 0, 1]), device=device), # pylint: disable=line-too-long
                                                     num_steps = num_steps,
                                                     lambda_d = lam_d_loss,
                                                     lambda_m = lam_m_loss,
                                                     device = device)
-            print (f'Elapsed: {(perf_counter()-start_time):.1f} s')
+            print (f'Optimization took: {(perf_counter()-start_time):.1f} s')
 
             # Render debug output: optional video and projected image and W vector.
             if save_video:
+                start_time = perf_counter()
                 save_video_showing_optimization(fname = f'{outdir_this_image}proj.mp4',
                                                 w_steps = projected_w_steps,
                                                 m_steps = mask_steps,
                                                 G = G,
+                                                losses = losses,
                                                 target = target)
+                print (f'Saving the video took: {(perf_counter()-start_time):.1f} s')
 
-            # Save final projected frame
-            target_image = utils_data.convert_pil_to_arr(np.squeeze(target))
-            synth_image = G.synthesis(projected_w_steps[-1].unsqueeze(0), noise_mode='const')
-            synth_image = synth_image.permute(0, 2, 3, 1)[0,:,:,0].cpu().numpy()
-            mask = mask_steps.permute(0, 2, 3, 1)[-1,:,:,0].cpu().numpy()
-            images_to_save = [target_image, synth_image, target_image - synth_image, mask]
-            utils_vis.save_images(images = images_to_save,
-                                  fname = f'{outdir_this_image}result.png',
-                                  nr = 1,
-                                  nc = len(images_to_save))
+                # Save final projected frame
+                target_image = utils_data.convert_pil_to_arr(np.squeeze(target))
+                synth_image = G.synthesis(projected_w_steps[-1].unsqueeze(0), noise_mode='const')
+                synth_image = synth_image.permute(0, 2, 3, 1)[0,:,:,0].cpu().numpy()
+                mask = mask_steps.permute(0, 2, 3, 1)[-1,:,:,0].cpu().numpy()
+                images_to_save = [target_image, synth_image, target_image - synth_image, mask]
+                utils_vis.save_images(images = images_to_save,
+                                    fname = f'{outdir_this_image}result.png',
+                                    nr = 1,
+                                    nc = len(images_to_save))
 
-            # Save final W vector.
-            np.savez(f'{outdir_this_image}projected_w.npz',
-                     w=projected_w_steps[-1].unsqueeze(0).cpu().numpy())
+                # Save final W vector.
+                np.savez(f'{outdir_this_image}projected_w.npz',
+                        w=projected_w_steps[-1].unsqueeze(0).cpu().numpy())
 
 #----------------------------------------------------------------------------
 
